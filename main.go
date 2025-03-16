@@ -1,116 +1,140 @@
 package main
 
 import (
-	"flag"
 	"fmt"
+	"log"
 	"net"
+	"os"
 	"os/exec"
-	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
-// Get local IP
-func getLocalIP() string {
-	cmd := exec.Command("hostname", "-I") // Works on Linux
-	output, _ := cmd.Output()
-	localIP := strings.Fields(string(output))
-	if len(localIP) > 0 {
-		return localIP[0]
+// Get local network subnet
+func getLocalSubnet() (string, error) {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return "", err
 	}
-	return ""
+
+	for _, iface := range interfaces {
+		addrs, _ := iface.Addrs()
+		for _, addr := range addrs {
+			if ipNet, ok := addr.(*net.IPNet); ok && !ipNet.IP.IsLoopback() {
+				if ipNet.IP.To4() != nil {
+					ones, _ := ipNet.Mask.Size()
+					network := ipNet.IP.Mask(ipNet.Mask)
+					return fmt.Sprintf("%s/%d", network, ones), nil
+				}
+			}
+		}
+	}
+
+	return "", fmt.Errorf("no valid network interface found")
 }
 
-// Get peer IPs from arp -a
-func getPeers(myIP string) []string {
-	cmd := exec.Command("arp", "-a")
+// Ping an IP using system command
+func ping(ip string, wg *sync.WaitGroup, results chan<- string) {
+	defer wg.Done()
+
+	var cmd *exec.Cmd
+	if os.Getenv("OS") == "Windows_NT" {
+		cmd = exec.Command("ping", "-n", "1", "-w", "1000", ip) // Windows
+	} else {
+		cmd = exec.Command("ping", "-c", "1", "-W", "1", ip) // Linux/macOS
+	}
+
 	output, err := cmd.Output()
-	if err != nil {
-		fmt.Println("❌ Error running arp:", err)
-		return nil
-	}
-
-	re := regexp.MustCompile(`\d+\.\d+\.\d+\.\d+`)
-	ips := re.FindAllString(string(output), -1)
-
-	var peers []string
-	for _, ip := range ips {
-		if ip != myIP { // Ignore self
-			peers = append(peers, ip)
-		}
-	}
-	return peers
-}
-
-// Send UDP discovery message
-func sendDiscovery(peers []string) {
-	message := []byte("Hello, peer!") // Custom discovery message
-
-	for _, ip := range peers {
-		addr := fmt.Sprintf("%s:9999", ip) // Use port 9999
-		conn, err := net.Dial("udp", addr)
-		if err != nil {
-			fmt.Println("⚠️ Could not reach", ip)
-			continue
-		}
-		defer conn.Close()
-
-		conn.Write(message)
-		fmt.Println("📤 Sent discovery to", ip)
-		time.Sleep(100 * time.Millisecond) // Avoid flooding
+	if err == nil && strings.Contains(string(output), "ttl=") { // TTL check to confirm response
+		results <- ip
 	}
 }
 
-// Listen for UDP messages
-func receiveDiscovery() {
-	addr, err := net.ResolveUDPAddr("udp", ":9999")
-	if err != nil {
-		fmt.Println("❌ Error resolving address:", err)
+// Scan the network range
+func scanNetwork(subnet string) {
+	fmt.Println("🔍 Scanning network:", subnet)
+	timeStart := time.Now()
+
+	ipList := generateIPRange(subnet)
+	fmt.Println("📡 Found", len(ipList), "devices")
+
+	var wg sync.WaitGroup
+	results := make(chan string, len(ipList))
+
+	// Ping all IPs in parallel
+	for _, ip := range ipList {
+		wg.Add(1)
+		go ping(ip, &wg, results)
+	}
+
+	// Wait for all goroutines to finish
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// Collect active devices
+	activeDevices := []string{}
+	for ip := range results {
+		activeDevices = append(activeDevices, ip)
+	}
+
+	if len(activeDevices) == 0 {
+		fmt.Println("⚠️ No active devices found!")
 		return
 	}
 
-	conn, err := net.ListenUDP("udp", addr)
-	if err != nil {
-		fmt.Println("❌ Error listening:", err)
-		return
+	fmt.Printf("\n✅ Active Devices Found: %d\n", len(activeDevices))
+	for _, ip := range activeDevices {
+		fmt.Printf("IP: %s\n", ip)
 	}
-	defer conn.Close()
 
-	fmt.Println("📡 Listening for peers on port 9999...")
+	duration := time.Since(timeStart)
+	fmt.Printf("\n⏱️ Scan completed in %s\n", duration)
+}
 
-	buffer := make([]byte, 1024)
-	for {
-		n, remoteAddr, err := conn.ReadFromUDP(buffer)
-		if err != nil {
-			fmt.Println("⚠️ Error reading:", err)
-			continue
+// Generate a list of all IPs in the subnet
+func generateIPRange(subnet string) []string {
+	_, ipv4Net, err := net.ParseCIDR(subnet)
+	if err != nil {
+		fmt.Println("❌ Invalid subnet:", err)
+		os.Exit(1)
+	}
+
+	var ips []string
+	for ip := ipv4Net.IP.Mask(ipv4Net.Mask); ipv4Net.Contains(ip); inc(ip) {
+		ips = append(ips, ip.String())
+	}
+
+	// Remove network and broadcast addresses
+	if len(ips) > 2 {
+		return ips[1 : len(ips)-1]
+	}
+	log.Println("ips ", ips)
+	return ips
+}
+
+// Increment an IP address
+func inc(ip net.IP) {
+	for j := len(ip) - 1; j >= 0; j-- {
+		ip[j]++
+		if ip[j] > 0 {
+			break
 		}
-		fmt.Printf("✅ Received from %s: %s\n", remoteAddr, string(buffer[:n]))
 	}
 }
 
 func main() {
-	// Define command-line flags
-	sendFlag := flag.Bool("send", false, "Send UDP discovery message")
-	receiveFlag := flag.Bool("receive", false, "Listen for UDP discovery messages")
-	flag.Parse()
+	timeStart := time.Now()
 
-	if *sendFlag {
-		myIP := getLocalIP()
-		fmt.Println("🚀 Your IP:", myIP)
-
-		peers := getPeers(myIP)
-		if len(peers) == 0 {
-			fmt.Println("⚠️ No peers found.")
-			return
-		}
-
-		fmt.Println("🔍 Peers found:", peers)
-		sendDiscovery(peers)
-	} else if *receiveFlag {
-		receiveDiscovery()
-	} else {
-		fmt.Println("Usage: go run main.go -send   # To send discovery")
-		fmt.Println("       go run main.go -receive # To receive messages")
+	localSubnet, err := getLocalSubnet()
+	if err != nil {
+		log.Fatalf("❌ Error getting subnet: %v", err)
 	}
+
+	scanNetwork(localSubnet)
+
+	totalDuration := time.Since(timeStart)
+	fmt.Printf("\n⏳ Total execution time: %s\n", totalDuration)
 }
