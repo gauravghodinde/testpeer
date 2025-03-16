@@ -15,7 +15,7 @@ func main() {
 		Limit:     -1,               // Find unlimited peers
 		TimeLimit: 30 * time.Second, // Run for 30 seconds
 		Delay:     2000,             // Wait 2 seconds before retrying
-		AllowSelf: true,             // Allow self-discovery (for debugging)
+		AllowSelf: false,            // Allow self-discovery (for debugging)
 	})
 
 	if err != nil {
