@@ -16,7 +16,6 @@ func main() {
 		TimeLimit: 30 * time.Second, // Run for 30 seconds
 		Delay:     2000,             // Wait 2 seconds before retrying
 		AllowSelf: true,             // Allow self-discovery (for debugging)
-		Multicast: true,             // Enable multicast (if broadcast is blocked)
 	})
 
 	if err != nil {
